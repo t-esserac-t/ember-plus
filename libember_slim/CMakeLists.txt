@@ -156,3 +156,14 @@ install(
             DESTINATION ${EMBER_SLIM_CMAKE_CONFIG_DESTINATION}
     )
 
+# --- Tools / Samples ---
+# Build a read-only provider with TCP + JSON update port
+add_executable(ro_provider
+    Source/ro_provider.c
+)
+target_link_libraries(ro_provider PRIVATE ember_slim-static)
+if (WIN32)
+    target_link_libraries(ro_provider PRIVATE Ws2_32)
+endif()
+
+
