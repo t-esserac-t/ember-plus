@@ -1,0 +1,507 @@
+/*
+   ro_provider - Read-only Ember+ provider with JSON TCP updater
+
+   Builds on the existing libember_slim sample provider by including its
+   implementation and layering:
+   - Forces all parameters to GlowAccess_Read (Viewer cannot write)
+   - Starts a localhost JSON TCP listener on 127.0.0.1:5001
+     Accepts lines like: {"path":"root.non-food.audio.volume","value":-12.3}\n
+   Note: This file intentionally includes the original sample provider C file
+   and wraps selected functions via preprocessor renaming to avoid copying a
+   large amount of code while keeping behavior consistent.
+*/
+
+#define _CRT_SECURE_NO_WARNINGS
+#define _CRT_NONSTDC_NO_DEPRECATE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <process.h>
+#include <WinSock2.h>
+#include <WS2tcpip.h>
+#include <windows.h>
+
+// Ensure Ws2_32 gets linked even outside MSVC pragmas
+#pragma comment(lib, "Ws2_32.lib")
+
+// Serialize all outbound writes to avoid frame interleaving across threads
+static CRITICAL_SECTION g_sendCs;
+static int g_sendCsInitialized = 0;
+static int send_with_lock(SOCKET s, const char* buf, int len, int flags)
+{
+    if (g_sendCsInitialized) EnterCriticalSection(&g_sendCs);
+    // Use WSASend to avoid recursion if send is macro-replaced
+    WSABUF wbuf; DWORD sent = 0; int rc;
+    wbuf.buf = (CHAR*)buf; wbuf.len = (ULONG)len;
+    rc = WSASend(s, &wbuf, 1, &sent, 0, NULL, NULL);
+    if (g_sendCsInitialized) LeaveCriticalSection(&g_sendCs);
+    if (rc == 0) return (int)sent; else return SOCKET_ERROR;
+}
+
+// Replace send() in included sample with our locked variant
+#define send send_with_lock
+
+// Rename the original sample's internal functions so we can wrap them
+#define handleClient handleClient_impl
+#define acceptClient acceptClient_impl
+// Interpose reader initialization to inject our logging wrappers
+#define glowReader_init glowReader_init_wrapped
+
+// Pull in the original sample provider implementation
+#include "__sample_provider.c"
+
+#undef handleClient
+#undef acceptClient
+#undef glowReader_init
+
+// ----------------------------------------------------------------------
+// Globals to bridge JSON thread updates to the current Ember+ client
+// ----------------------------------------------------------------------
+static volatile SOCKET g_clientSock = INVALID_SOCKET;
+
+// Forward decls from included sample (in same TU)
+extern SampleNode _root;
+static const char* safeIdent(SampleNode* n)
+{
+    if (!n) return "?";
+    if (n->isParameter) return n->param.pIdentifier ? n->param.pIdentifier : "?";
+    return n->node.pIdentifier ? n->node.pIdentifier : "?";
+}
+
+static void path_to_ident_string(const berint *pPath, int pathLength, char *out, size_t cap)
+{
+    out[0] = '\0';
+    SampleNode *cursor = &_root;
+    size_t used = 0;
+    for (int i = 0; i < pathLength; ++i)
+    {
+        int idx = (int)pPath[i];
+        if (idx < 0 || idx >= cursor->childrenCount) break;
+        SampleNode *child = cursor->children[idx];
+        const char *id = safeIdent(child);
+        size_t len = strlen(id);
+        if (used && used + 1 < cap) out[used++] = '.';
+        if (used + len >= cap) len = cap - used - 1;
+        memcpy(out + used, id, len);
+        used += len;
+        out[used] = '\0';
+        cursor = child;
+    }
+}
+
+// ----------------------------------------------------------------------
+// Utilities: trim, parse minimal JSON line (path + value)
+// ----------------------------------------------------------------------
+static void trim(char *s)
+{
+    char *p = s;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (p != s) memmove(s, p, strlen(p)+1);
+    size_t n = strlen(s);
+    while (n>0 && isspace((unsigned char)s[n-1])) { s[--n] = '\0'; }
+}
+
+static int parse_json_line(const char *line, char *outPath, size_t outPathSize, long double *outValue)
+{
+    // extremely small JSON extractor: expects {"path":"...","value":<num>}
+    const char *pPath = strstr(line, "\"path\"");
+    const char *pValue = strstr(line, "\"value\"");
+    if (!pPath || !pValue) return 0;
+    const char *q = strchr(pPath, '"');
+    if (!q) return 0; // first quote
+    q = strchr(q+1, '"');
+    if (!q) return 0; // second quote after key
+    const char *start = strchr(q+1, '"');
+    if (!start) return 0;
+    const char *end = strchr(start+1, '"');
+    if (!end) return 0;
+    size_t len = (size_t)(end - (start+1));
+    if (len >= outPathSize) len = outPathSize - 1;
+    memcpy(outPath, start+1, len);
+    outPath[len] = '\0';
+
+    // value: find ':' after "value"
+    const char *colon = strchr(pValue, ':');
+    if (!colon) return 0;
+    char *endptr = NULL;
+    long double v = strtold(colon+1, &endptr);
+    if (endptr == colon+1) return 0; // no number
+    *outValue = v;
+    return 1;
+}
+
+// ----------------------------------------------------------------------
+// Tree helpers: find node by identifier path, compute numeric path
+// ----------------------------------------------------------------------
+static int get_child_index_by_identifier(SampleNode *parent, const char *ident)
+{
+    int i;
+    for (i = 0; i < parent->childrenCount; i++)
+    {
+        SampleNode *c = parent->children[i];
+        if (c == NULL) continue;
+        if (c->isParameter)
+        {
+            if (c->param.pIdentifier && strcmp(c->param.pIdentifier, ident) == 0)
+                return i;
+        }
+        else
+        {
+            if (c->node.pIdentifier && strcmp(c->node.pIdentifier, ident) == 0)
+                return i;
+        }
+    }
+    return -1;
+}
+
+static SampleNode* find_by_identifier_path(const char *path, berint *outIdxPath, int *outLen)
+{
+    // path like: root.non-food.audio.volume
+    char buf[256];
+    strncpy(buf, path, sizeof(buf)-1);
+    buf[sizeof(buf)-1] = '\0';
+
+    SampleNode *cursor = &_root;
+    int len = 0;
+    char *saveptr = NULL;
+    char *tok = strtok_s(buf, ".", &saveptr);
+    while (tok)
+    {
+        int idx = get_child_index_by_identifier(cursor, tok);
+        if (idx < 0) break;
+        if (outIdxPath && len < GLOW_MAX_TREE_DEPTH)
+            outIdxPath[len] = (berint)idx;
+        len++;
+        cursor = cursor->children[idx];
+        tok = strtok_s(NULL, ".", &saveptr);
+    }
+    if (outLen) *outLen = len;
+    return cursor;
+}
+
+// Allow friendly aliases like "demo.level" and optional missing root prefix
+static int try_resolve_with_variants(const char *input, berint *outIdxPath, int *outLen, SampleNode **outNode)
+{
+    // 1) direct
+    SampleNode *n = find_by_identifier_path(input, outIdxPath, outLen);
+    if (n && n->isParameter) { *outNode = n; return 1; }
+
+    // 2) prepend root.
+    if (strncmp(input, "root.", 5) != 0)
+    {
+        char tmp[300];
+        snprintf(tmp, sizeof(tmp), "root.%s", input);
+        int len2 = 0; berint p2[GLOW_MAX_TREE_DEPTH];
+        n = find_by_identifier_path(tmp, p2, &len2);
+        if (n && n->isParameter) { memcpy(outIdxPath, p2, sizeof(berint)*len2); *outLen = len2; *outNode = n; return 1; }
+    }
+
+    // 3) friendly aliases
+    if (strcmp(input, "demo.level") == 0)
+    {
+        const char *alias = "root.non-food.audio.volume";
+        int len3 = 0; berint p3[GLOW_MAX_TREE_DEPTH];
+        n = find_by_identifier_path(alias, p3, &len3);
+        if (n && n->isParameter) { memcpy(outIdxPath, p3, sizeof(berint)*len3); *outLen = len3; *outNode = n; return 1; }
+    }
+    else if (strcmp(input, "demo.gain") == 0)
+    {
+        const char *alias = "root.non-food.audio.gain";
+        int len3 = 0; berint p3[GLOW_MAX_TREE_DEPTH];
+        n = find_by_identifier_path(alias, p3, &len3);
+        if (n && n->isParameter) { memcpy(outIdxPath, p3, sizeof(berint)*len3); *outLen = len3; *outNode = n; return 1; }
+    }
+    else if (strcmp(input, "demo.format") == 0)
+    {
+        const char *alias = "root.non-food.audio.format";
+        int len3 = 0; berint p3[GLOW_MAX_TREE_DEPTH];
+        n = find_by_identifier_path(alias, p3, &len3);
+        if (n && n->isParameter) { memcpy(outIdxPath, p3, sizeof(berint)*len3); *outLen = len3; *outNode = n; return 1; }
+    }
+
+    *outNode = n; // could be NULL or non-parameter
+    return 0;
+}
+
+static void make_read_only_recursive(SampleNode *n)
+{
+    if (n == NULL) return;
+    if (n->isParameter)
+    {
+        n->param.access = GlowAccess_Read;
+        n->fields |= GlowFieldFlag_Access;
+    }
+    int i;
+    for (i = 0; i < n->childrenCount; i++)
+        make_read_only_recursive(n->children[i]);
+}
+
+// ----------------------------------------------------------------------
+// Publish updated value to Ember+ client
+// ----------------------------------------------------------------------
+static void publish_parameter_value(SampleNode *paramNode, const berint *idxPath, int pathLen)
+{
+    printf_s("[tx] publish_parameter_value is called.\n");
+    if (g_clientSock == INVALID_SOCKET) {
+    printf_s("[tx] g_clientSock is INVALID_SOCKET. return.\n");
+    return;
+    }
+
+    if (!(paramNode && paramNode->isParameter)){
+    printf_s("[tx] !(paramNode && paramNode->isParameter). return.\n");
+    return;
+    }
+
+
+    const int bufferSize = 512;
+    byte *pBuffer = newarr(byte, bufferSize);
+    GlowOutput output;
+    glowOutput_init(&output, pBuffer, bufferSize, 0);
+    glowOutput_beginPackage(&output, true);
+    glow_writeQualifiedParameter(&output, &paramNode->param, GlowFieldFlag_Value, idxPath, pathLen);
+    int bytes = glowOutput_finishPackage(&output);
+    char pathStr[256];
+    path_to_ident_string(idxPath, pathLen, pathStr, sizeof(pathStr));
+    printf_s("[tx] send value update for %s, %d bytes\n", pathStr, bytes);
+    int sent = send(g_clientSock, (char *)pBuffer, bytes, 0);
+    if (sent == SOCKET_ERROR)
+    {
+        int err = WSAGetLastError();
+        printf_s("[tx] send error WSA=%d\n", err);
+    }
+    freeMemory(pBuffer);
+}
+
+static void set_value_and_publish(const char *identifierPath, long double value)
+{
+    berint idxPath[GLOW_MAX_TREE_DEPTH];
+    int pathLen = 0;
+    SampleNode *n = NULL;
+    int ok = try_resolve_with_variants(identifierPath, idxPath, &pathLen, &n);
+    if (!ok)
+    {
+        printf_s("[json] target not found or not a parameter: %s\n", identifierPath);
+        return;
+    }
+
+    // Update numeric types only (Integer/Real)
+    if (n->param.value.flag == GlowParameterType_Real)
+    {
+        long double prev = n->param.value.choice.real;
+        n->param.value.choice.real = value;
+        char pathStr[256];
+        path_to_ident_string(idxPath, pathLen, pathStr, sizeof(pathStr));
+        printf_s("[json] updated REAL %s: %Lg -> %Lg\n", pathStr, prev, value);
+    }
+    else if (n->param.value.flag == GlowParameterType_Integer)
+    {
+        // clamp to berint range
+        if (value > (long double)LLONG_MAX) value = (long double)LLONG_MAX;
+        if (value < (long double)LLONG_MIN) value = (long double)LLONG_MIN;
+        berint prev = n->param.value.choice.integer;
+        n->param.value.choice.integer = (berint)(long long)value;
+        char pathStr[256];
+        path_to_ident_string(idxPath, pathLen, pathStr, sizeof(pathStr));
+        printf_s("[json] updated INTEGER %s: %lld -> %lld\n", pathStr, (long long)prev, (long long)n->param.value.choice.integer);
+    }
+    else
+    {
+        printf_s("[json] unsupported parameter type for %s; only Integer/Real supported\n", identifierPath);
+        return; // unsupported type for this simple updater
+    }
+    printf_s("[json] trying to call publish_parameter_value...\n");
+    publish_parameter_value(n, idxPath, pathLen);
+}
+
+// ----------------------------------------------------------------------
+// JSON TCP listener thread (127.0.0.1:5001)
+// ----------------------------------------------------------------------
+static unsigned __stdcall json_listener(void *arg)
+{
+    SOCKET ls = INVALID_SOCKET;
+    struct sockaddr_in addr;
+    int on = 1;
+
+    ls = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (ls == INVALID_SOCKET) return 0;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof(on));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(5001);
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (bind(ls, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) { closesocket(ls); return 0; }
+    if (listen(ls, 4) == SOCKET_ERROR) { closesocket(ls); return 0; }
+
+    printf_s("[json] listening on 127.0.0.1:5001\n");
+
+    for(;;)
+    {
+        struct sockaddr_in peer;
+        int peerlen = sizeof(peer);
+        char ipstr[INET_ADDRSTRLEN] = {0};
+        SOCKET cs = accept(ls, (struct sockaddr*)&peer, &peerlen);
+        if (cs == INVALID_SOCKET) break;
+        inet_ntop(AF_INET, &peer.sin_addr, ipstr, sizeof(ipstr));
+        printf_s("[json] client connected from %s:%d\n", ipstr, (int)ntohs(peer.sin_port));
+        char buf[1024];
+        int n = recv(cs, buf, sizeof(buf)-1, 0);
+        if (n > 0)
+        {
+            buf[n] = '\0';
+            // read only first line
+            char *nl = strchr(buf, '\n');
+            if (nl) *nl = '\0';
+            trim(buf);
+            printf_s("[json] received %d bytes: %s\n", n, buf);
+            char path[256];
+            long double val = 0.0;
+            if (parse_json_line(buf, path, sizeof(path), &val))
+            {
+                printf_s("[json] parsed path='%s' value=%Lg\n", path, val);
+                set_value_and_publish(path, val);
+            }
+            else
+            {
+                printf_s("[json] parse failed; expected {\"path\":...,\"value\":...}\n");
+            }
+        }
+        else
+        {
+            printf_s("[json] recv returned %d\n", n);
+        }
+        closesocket(cs);
+    }
+
+    closesocket(ls);
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// Wrap sample callbacks with logs for subscribe/unsubscribe/value set
+// ----------------------------------------------------------------------
+static void onParameter_logged(const GlowParameter *pParameter, GlowFieldFlags fields, const berint *pPath, int pathLength, voidptr state)
+{
+    char pathStr[256];
+    path_to_ident_string(pPath, pathLength, pathStr, sizeof(pathStr));
+    if ((fields & GlowFieldFlag_Value) == GlowFieldFlag_Value)
+    {
+        if (pParameter->value.flag == GlowParameterType_Real)
+            printf_s("[rx] SET value REAL %s = %Lg\n", pathStr, pParameter->value.choice.real);
+        else if (pParameter->value.flag == GlowParameterType_Integer)
+            printf_s("[rx] SET value INT %s = %lld\n", pathStr, (long long)pParameter->value.choice.integer);
+        else if (pParameter->value.flag == GlowParameterType_String)
+            printf_s("[rx] SET value STR %s = '%s'\n", pathStr, pParameter->value.choice.pString ? pParameter->value.choice.pString : "");
+        else
+            printf_s("[rx] SET value %s (type=%d)\n", pathStr, (int)pParameter->value.flag);
+    }
+    onParameter(pParameter, fields, pPath, pathLength, state);
+}
+
+static void onCommand_logged(const GlowCommand *pCommand, const berint *pPath, int pathLength, voidptr state)
+{
+    char pathStr[256];
+    path_to_ident_string(pPath, pathLength, pathStr, sizeof(pathStr));
+    if (pCommand->number == GlowCommandType_Subscribe)
+    {
+        printf_s("[rx] SUBSCRIBE %s\n", pathStr);
+    }
+    else if (pCommand->number == GlowCommandType_Unsubscribe)
+    {
+        printf_s("[rx] UNSUBSCRIBE %s\n", pathStr);
+    }
+    else if (pCommand->number == GlowCommandType_GetDirectory)
+    {
+        printf_s("[rx] GET-DIRECTORY %s (mask=0x%X)\n", pathStr, (unsigned int)pCommand->options.dirFieldMask);
+    }
+    onCommand(pCommand, pPath, pathLength, state);
+}
+
+// Forward declaration of real glowReader_init
+void glowReader_init(GlowReader *pThis,
+    onNode_t onNode,
+    onParameter_t onParameter,
+    onCommand_t onCommand,
+    onStreamEntry_t onStreamEntry,
+    voidptr state,
+    byte *pRxBuffer,
+    unsigned int rxBufferSize);
+
+// Interposed reader init: inject our logging callbacks, then return
+static void glowReader_init_wrapped(GlowReader *pReader,
+    onNode_t onNode,
+    onParameter_t onParam,
+    onCommand_t onCmd,
+    onStreamEntry_t onStream,
+    voidptr state,
+    byte *pRxBuffer,
+    unsigned int rxBufferSize)
+{
+    // call real glowReader_init with our wrappers
+    glowReader_init(pReader, onNode, onParameter_logged, onCommand_logged, onStream, state, pRxBuffer, rxBufferSize);
+}
+
+// ----------------------------------------------------------------------
+// Wrappers: make all params read-only; start JSON listener; delegate
+// ----------------------------------------------------------------------
+static void handleClient(SOCKET sock)
+{
+    g_clientSock = sock; // expose to publisher
+    handleClient_impl(sock);
+    g_clientSock = INVALID_SOCKET;
+}
+
+static void acceptClient(int port)
+{
+    // Start JSON listener thread beforehand; reuse sample's socket init
+    initSockets();
+    if (!g_sendCsInitialized) { InitializeCriticalSection(&g_sendCs); g_sendCsInitialized = 1; }
+    uintptr_t th = _beginthreadex(NULL, 0, json_listener, NULL, 0, NULL);
+    if (th) CloseHandle((HANDLE)th);
+
+    // Implement our own accept loop to ensure we can wrap handleClient
+    SOCKET listenSock, clientSock;
+    struct sockaddr_in localAddr;
+
+    listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = INADDR_ANY;
+    localAddr.sin_port = htons((unsigned short)port);
+    bind(listenSock, (struct sockaddr *)&localAddr, sizeof(localAddr));
+    listen(listenSock, 1);
+
+    clientSock = accept(listenSock, NULL, NULL);
+    if(clientSock > 0)
+    {
+        printf_s("client accepted\n");
+        handleClient(clientSock);
+    }
+
+    closesocket(listenSock);
+
+    shutdownSockets();
+    if (g_sendCsInitialized) { DeleteCriticalSection(&g_sendCs); g_sendCsInitialized = 0; }
+}
+
+// Entry point mirroring sample, but enforce read-only fields
+int main(int argc, char **argv)
+{
+    ember_init(onThrowError, onFailAssertion, malloc, free);
+    initializePpmStreams();
+    buildTree(&_root);
+
+    // Force all parameters to read-only
+    make_read_only_recursive(&_root);
+
+    int port = 9000;
+    if (argc >= 2)
+        port = atoi(argv[1]);
+
+    printf_s("[ro_provider] Ember+ provider on %d; JSON on 127.0.0.1:5001\n", port);
+    acceptClient(port);
+
+    sampleNode_free(&_root);
+    freePpmStreams();
+    return 0;
+}
